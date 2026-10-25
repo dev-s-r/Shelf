@@ -1,0 +1,201 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Permanent signing key: the encrypted file signing/app.keystore.enc is unlocked by the SIGNING_PASSPHRASE secret.
+      # (Advanced: you can instead provide KEYSTORE_BASE64 + KEYSTORE_PASSWORD + KEY_ALIAS + KEY_PASSWORD.)
+      SIGNING_PASSPHRASE: ${{ secrets.SIGNING_PASSPHRASE }}
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Finds the project automatically. Files already in the repo always win;
+      # anything missing is taken from a sub-folder or from an archive
+      # (.zip, .tar.gz, .tgz, .tar, .7z) uploaded anywhere in the repo.
+      - name: Locate project
+        shell: bash
+        run: |
+          set -e
+          TMP="$RUNNER_TEMP/unpacked"; mkdir -p "$TMP"
+
+          # 1. unpack every archive found in the repo
+          n=0
+          while IFS= read -r -d '' a; do
+            n=$((n+1)); d="$TMP/$n"; mkdir -p "$d"
+            echo "Unpacking $a"
+            case "${a,,}" in
+              *.zip)            unzip -q -o "$a" -d "$d" || true ;;
+              *.tar.gz|*.tgz)   tar -xzf "$a" -C "$d" || true ;;
+              *.tar)            tar -xf "$a" -C "$d" || true ;;
+              *.7z)             7z x -y -o"$d" "$a" > /dev/null || true ;;
+            esac
+          done < <(find . -maxdepth 4 -type f \( -iname '*.zip' -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.tar' -o -iname '*.7z' \) -not -path './.git/*' -not -path '*/node_modules/*' -print0)
+
+          # 2. copy project files up to the repo root WITHOUT overwriting anything already there
+          merge() {
+            CFG=$(find "$1" -maxdepth 5 -name capacitor.config.json -not -path '*/node_modules/*' -not -path '*/__MACOSX/*' | head -1)
+            if [ -n "$CFG" ]; then
+              DIR=$(dirname "$CFG"); echo "Merging project from $DIR"
+              cp -an "$DIR"/. . || true
+            fi
+          }
+          # project in a sub-folder of the repo
+          if [ ! -f package.json ] || [ ! -f capacitor.config.json ]; then merge .; fi
+          # project inside archives
+          for d in "$TMP"/*/; do [ -d "$d" ] && merge "$d"; done
+
+          # 2b. loose files uploaded outside the archive replace the same-named project file.
+          #     A loose file is found in the repo root or one folder deep; names that exist twice in the project are skipped.
+          PROJ=$(find web scripts android-src -type f 2>/dev/null || true)
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            base=$(basename "$f")
+            [ "$(printf '%s\n' "$PROJ" | awk -v b="$base" -F/ '$NF==b' | wc -l)" = "1" ] || continue
+            loose=$(find . -maxdepth 2 -type f -name "$base" -not -path './.git/*' -not -path './node_modules/*' -not -path './web/*' -not -path './scripts/*' -not -path './android-src/*' -not -path './www/*' -not -path './android/*' -not -path './.github/*' -not -path './signing/*' | awk '{print length($0) " " $0}' | sort -n | head -1 | cut -d' ' -f2-)
+            if [ -n "$loose" ]; then echo "Using loose file $loose for $f"; cp -f "$loose" "$f"; fi
+          done <<< "$PROJ"
+
+          # 3. final check
+          if [ ! -f package.json ] || [ ! -d web ]; then
+            echo "::error::Project files not found. Upload shelf-app.zip (or all project files) to the repo."
+            ls -la
+            exit 1
+          fi
+          echo "Project ready:"; ls -la
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare signing key
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KS_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KS_KEYPASS=$KEY_PASSWORD" >> "$GITHUB_ENV"
+          elif [ -n "$SIGNING_PASSPHRASE" ] && [ -f signing/app.keystore.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in signing/app.keystore.enc -out "$RUNNER_TEMP/release.jks" -pass env:SIGNING_PASSPHRASE
+            echo "KS_PASS=app-ks" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=app" >> "$GITHUB_ENV"
+            echo "KS_KEYPASS=app-ks" >> "$GITHUB_ENV"
+          fi
+          if [ -f "$RUNNER_TEMP/release.jks" ]; then
+            echo "HAVE_KEY=true" >> "$GITHUB_ENV"
+            echo "Permanent signing key ready"
+          else
+            echo "::warning::No permanent signing key. Add the SIGNING_PASSPHRASE secret so updates keep your data."
+          fi
+
+      - name: Build web assets
+        run: node scripts/build-web.js
+
+      - name: Write build info
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          export PREV
+          PREV=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .body 2>/dev/null || echo "")
+          node scripts/write-build-info.js
+
+      - name: Create Android project
+        run: npx cap add android
+
+      - name: Customise Android project (Java files, permissions, icons, version)
+        run: node scripts/prepare-android.js
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Build debug APK (no permanent key)
+        if: env.HAVE_KEY != 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Build and sign APK (permanent key)
+        if: env.HAVE_KEY == 'true'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          SRC=""
+          if ./gradlew assembleRelease --no-daemon; then
+            SRC=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          else
+            echo "::warning::Release build failed, signing the debug build instead"
+            ./gradlew assembleDebug --no-daemon
+            SRC=app/build/outputs/apk/debug/app-debug.apk
+          fi
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$BT/zipalign" -p -f 4 "$SRC" "$RUNNER_TEMP/aligned.apk"
+          KS_PASS="$KS_PASS" KS_KEYPASS="$KS_KEYPASS" "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$KS_ALIAS" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KS_KEYPASS \
+            --out "$GITHUB_WORKSPACE/Shelf.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$GITHUB_WORKSPACE/Shelf.apk" | head -3
+
+      - name: Collect files
+        run: |
+          mkdir -p dist
+          if [ -f Shelf.apk ]; then
+            cp Shelf.apk dist/
+            (cd www && zip -qr ../dist/web-bundle.zip .)
+          else
+            cp android/app/build/outputs/apk/debug/app-debug.apk dist/Shelf-debug.apk
+          fi
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Shelf-apk
+          path: dist/*.apk
+
+      - name: Publish update release
+        if: env.HAVE_KEY == 'true' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: b${{ github.run_number }}
+          name: Shelf build ${{ github.run_number }}
+          body_path: release-info.json
+          make_latest: true
+          files: |
+            dist/Shelf.apk
+            dist/web-bundle.zip
+
+      - name: Remove old releases (keep the newest 10)
+        if: env.HAVE_KEY == 'true' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName --jq '.[].tagName' | tail -n +11 | while read -r t; do
+            gh release delete "$t" --cleanup-tag -y || true
+          done
